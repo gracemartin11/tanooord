@@ -32,7 +32,7 @@ jobs:
   secure-rdp:
     needs: prepare
     runs-on: windows-latest
-    timeout-minutes: 330
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
