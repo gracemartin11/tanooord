@@ -1,0 +1,102 @@
+name: Secure VPN Exit Node Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      num_jobs:
+        description: "How many VPN Exit Node jobs do you want to run? (1-5)"
+        required: true
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "4"
+          - "5"
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Create matrix
+        id: set-matrix
+        run: |
+          N=${{ github.event.inputs.num_jobs }}
+          MATRIX=$(python3 -c "import json; print(json.dumps(list(range(1, $N + 1))))")
+          echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
+          echo "Will start $N pure VPN Exit Node job(s): $MATRIX"
+
+  vpn-exit-node:
+    needs: prepare
+    runs-on: windows-latest
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        job: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Install Tailscale
+        run: |
+          Write-Host "=== Installing Tailscale ==="
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.84.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i `"$installerPath`" /quiet /norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Start Tailscale as Full Exit Node (VPN)
+        run: |
+          Write-Host "=== Starting Tailscale and advertising as Exit Node (full VPN) ==="
+          $hostname = "gh-vpn-exit-${{ github.run_id }}-${{ matrix.job }}"
+          
+          # Bring up Tailscale with exit node advertisement (this is pure VPN / exit node)
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=$hostname `
+            --advertise-exit-node `
+            --accept-dns=false
+          
+          Start-Sleep -Seconds 15
+          
+          # Ensure exit node is advertised
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" set --advertise-exit-node
+          
+          $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          echo "HOSTNAME=$hostname" >> $env:GITHUB_ENV
+          
+          Write-Host "Tailscale IP: $tsIP"
+          Write-Host "Hostname: $hostname"
+          Write-Host "Exit Node (full VPN): Advertised ✅"
+
+      - name: Show VPN Connection Details
+        run: |
+          Write-Host "════════════════════════════════════════════════════"
+          Write-Host "✅ PURE VPN EXIT NODE INSTANCE ${{ matrix.job }} IS READY"
+          Write-Host "════════════════════════════════════════════════════"
+          Write-Host "IP Address : $($env:TAILSCALE_IP)"
+          Write-Host "Hostname   : $($env:HOSTNAME)"
+          Write-Host ""
+          Write-Host "This is a FULL ACCESS Tailscale Exit Node (regular VPN style)."
+          Write-Host "No RDP is enabled or configured."
+          Write-Host ""
+          Write-Host ">>> You MUST approve the exit node in the Tailscale Admin Console <<<"
+          Write-Host "1. Go to: https://login.tailscale.com/admin/machines"
+          Write-Host "2. Find this machine ($($env:HOSTNAME))"
+          Write-Host "3. Click ⋮ → Edit route settings → Approve exit node"
+          Write-Host ""
+          Write-Host "After approval, any device on your Tailnet can use this"
+          Write-Host "machine as a full VPN exit node (all traffic routes through it)."
+          Write-Host "════════════════════════════════════════════════════"
+
+      - name: Keep Runner Alive
+        run: |
+          $counter = 0
+          while ($true) {
+            $counter++
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Heartbeat #$counter – VPN Exit Node still active (job ${{ matrix.job }})"
+            Start-Sleep -Seconds 300
+          }
