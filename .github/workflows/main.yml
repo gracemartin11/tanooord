@@ -88,7 +88,7 @@ jobs:
           Write-Host "Tailscale IP: $tsIP"
           Write-Host "Hostname: $hostname"
 
-          # Save only the clean IP
+          # Save clean IP only
           "$tsIP" | Out-File -FilePath "rdp-ip-${{ matrix.job }}.txt" -Encoding utf8 -NoNewline
 
       - name: Verify RDP Port
@@ -118,23 +118,25 @@ jobs:
           path: rdp-ip-${{ matrix.job }}.txt
           retention-days: 1
 
-      - name: Keep Runner Alive (5 hours)
+      - name: Keep Runner Alive (6 hours)
         run: |
-          $endTime = (Get-Date).AddHours(5)
+          $endTime = (Get-Date).AddHours(6)
           $counter = 0
           while ((Get-Date) -lt $endTime) {
             $counter++
-            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Heartbeat #$counter – still alive (job ${{ matrix.job }}) – will stop after 5 hours"
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Heartbeat #$counter – still alive (job ${{ matrix.job }})"
             Start-Sleep -Seconds 300
           }
-          Write-Host "5 hours completed. Exiting so summarize job can run."
 
-  # This job now runs after the 5-hour keep-alive finishes
+  # This job runs in PARALLEL – does NOT wait for the RDP jobs
   summarize:
-    needs: secure-rdp
-    if: always()
     runs-on: ubuntu-latest
     steps:
+      - name: Wait for IP artifacts to be uploaded
+        run: |
+          echo "Waiting 2 minutes for all RDP jobs to upload their IPs..."
+          sleep 120
+
       - name: Download all IP artifacts
         uses: actions/download-artifact@v4
         with:
@@ -159,12 +161,12 @@ jobs:
               fi
             done
           else
-            echo "No IP artifacts found"
+            echo "No IP artifacts found yet"
           fi
 
           echo ""
           echo "════════════════════════════════════════════════════"
-          echo "File all-rdp-ips.txt is ready"
+          echo "File all-rdp-ips.txt is ready for download"
           echo "Username : RDP"
           echo "Password : (use your RDP_PASSWORD secret)"
           echo "════════════════════════════════════════════════════"
