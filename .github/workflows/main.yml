@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       num_jobs:
-        description: "How many RDP jobs do you want to run? (1-5)"
+        description: "How many RDP jobs do you want to run? (1-15)"
         required: true
         default: "1"
         type: choice
@@ -14,6 +14,16 @@ on:
           - "3"
           - "4"
           - "5"
+          - "6"
+          - "7"
+          - "8"
+          - "9"
+          - "10"
+          - "11"
+          - "12"
+          - "13"
+          - "14"
+          - "15"
 
 jobs:
   prepare:
@@ -37,7 +47,6 @@ jobs:
       fail-fast: false
       matrix:
         job: ${{ fromJSON(needs.prepare.outputs.matrix) }}
-
     steps:
       - name: Configure RDP
         run: |
@@ -79,6 +88,9 @@ jobs:
           Write-Host "Tailscale IP: $tsIP"
           Write-Host "Hostname: $hostname"
 
+          # Write IP to a file so we can collect them later
+          "$tsIP" | Out-File -FilePath "rdp-ip-${{ matrix.job }}.txt" -Encoding utf8
+
       - name: Verify RDP Port
         run: |
           $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
@@ -91,13 +103,20 @@ jobs:
       - name: Show Connection Details
         run: |
           Write-Host "════════════════════════════════════════════════════"
-          Write-Host "✅  RDP INSTANCE ${{ matrix.job }} IS READY"
+          Write-Host "✅ RDP INSTANCE ${{ matrix.job }} IS READY"
           Write-Host "════════════════════════════════════════════════════"
-          Write-Host "IP Address  : $($env:TAILSCALE_IP)"
-          Write-Host "Hostname    : $($env:HOSTNAME)"
-          Write-Host "Username    : RDP"
-          Write-Host "Password    : (from secret RDP_PASSWORD)"
+          Write-Host "IP Address : $($env:TAILSCALE_IP)"
+          Write-Host "Hostname   : $($env:HOSTNAME)"
+          Write-Host "Username   : RDP"
+          Write-Host "Password   : (from secret RDP_PASSWORD)"
           Write-Host "════════════════════════════════════════════════════"
+
+      - name: Upload IP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rdp-ip-${{ matrix.job }}
+          path: rdp-ip-${{ matrix.job }}.txt
+          retention-days: 1
 
       - name: Keep Runner Alive
         run: |
@@ -107,3 +126,35 @@ jobs:
             Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Heartbeat #$counter – still alive (job ${{ matrix.job }})"
             Start-Sleep -Seconds 300
           }
+
+  # Final job that collects every IP into one clean list
+  summarize:
+    needs: secure-rdp
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all IP artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ips
+          pattern: rdp-ip-*
+          merge-multiple: true
+
+      - name: Print all RDP IPs (copy-paste ready)
+        run: |
+          echo "════════════════════════════════════════════════════"
+          echo "✅ ALL RDP INSTANCES READY – COPY THE LIST BELOW"
+          echo "════════════════════════════════════════════════════"
+          echo ""
+          if [ -d ips ]; then
+            find ips -name "rdp-ip-*.txt" -exec cat {} \; | sort -V | while read ip; do
+              echo "$ip"
+            done
+          else
+            echo "No IPs found (jobs may still be starting or failed)"
+          fi
+          echo ""
+          echo "════════════════════════════════════════════════════"
+          echo "Username : RDP"
+          echo "Password : (use the value from your RDP_PASSWORD secret)"
+          echo "════════════════════════════════════════════════════"
