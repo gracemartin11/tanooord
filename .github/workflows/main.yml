@@ -88,8 +88,8 @@ jobs:
           Write-Host "Tailscale IP: $tsIP"
           Write-Host "Hostname: $hostname"
 
-          # Write IP to a file so we can collect them later
-          "$tsIP" | Out-File -FilePath "rdp-ip-${{ matrix.job }}.txt" -Encoding utf8
+          # Save only the IP (clean)
+          "$tsIP" | Out-File -FilePath "rdp-ip-${{ matrix.job }}.txt" -Encoding utf8 -NoNewline
 
       - name: Verify RDP Port
         run: |
@@ -127,7 +127,9 @@ jobs:
             Start-Sleep -Seconds 300
           }
 
-  # Final job that collects every IP into one clean list
+  # ────────────────────────────────────────────────
+  # Collect everything into ONE clean file + print it
+  # ────────────────────────────────────────────────
   summarize:
     needs: secure-rdp
     if: always()
@@ -140,21 +142,37 @@ jobs:
           pattern: rdp-ip-*
           merge-multiple: true
 
-      - name: Print all RDP IPs (copy-paste ready)
+      - name: Create single all-rdp-ips.txt + print list
         run: |
           echo "════════════════════════════════════════════════════"
-          echo "✅ ALL RDP INSTANCES READY – COPY THE LIST BELOW"
+          echo "✅ ALL RDP IPs (copy-paste ready)"
           echo "════════════════════════════════════════════════════"
           echo ""
+
+          > all-rdp-ips.txt   # create empty file
+
           if [ -d ips ]; then
-            find ips -name "rdp-ip-*.txt" -exec cat {} \; | sort -V | while read ip; do
-              echo "$ip"
+            # Collect every IP, sort numerically by the number in the filename
+            find ips -name "rdp-ip-*.txt" | sort -V | while read f; do
+              ip=$(cat "$f" | tr -d '\r\n ')
+              if [ -n "$ip" ]; then
+                echo "$ip" | tee -a all-rdp-ips.txt
+              fi
             done
           else
-            echo "No IPs found (jobs may still be starting or failed)"
+            echo "No IP artifacts found"
           fi
+
           echo ""
           echo "════════════════════════════════════════════════════"
+          echo "File 'all-rdp-ips.txt' contains the full list above"
           echo "Username : RDP"
-          echo "Password : (use the value from your RDP_PASSWORD secret)"
+          echo "Password : (use your RDP_PASSWORD secret)"
           echo "════════════════════════════════════════════════════"
+
+      - name: Upload the single combined file
+        uses: actions/upload-artifact@v4
+        with:
+          name: all-rdp-ips
+          path: all-rdp-ips.txt
+          retention-days: 1
