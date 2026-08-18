@@ -30,6 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
+      count: ${{ steps.set-matrix.outputs.count }}
     steps:
       - name: Create matrix
         id: set-matrix
@@ -37,7 +38,8 @@ jobs:
           N=${{ github.event.inputs.num_jobs }}
           MATRIX=$(python3 -c "import json; print(json.dumps(list(range(1, $N + 1))))")
           echo "matrix=$MATRIX" >> $GITHUB_OUTPUT
-          echo "Will start $N RDP job(s): $MATRIX"
+          echo "count=$N" >> $GITHUB_OUTPUT
+          echo "Will start $N RDP job(s)"
 
   secure-rdp:
     needs: prepare
@@ -128,21 +130,44 @@ jobs:
             Start-Sleep -Seconds 300
           }
 
-  # This job runs in PARALLEL – does NOT wait for the RDP jobs
+  # Starts right after prepare and waits only until ALL IPs are ready
   summarize:
+    needs: prepare
     runs-on: ubuntu-latest
     steps:
-      - name: Wait for IP artifacts to be uploaded
+      - name: Wait until all IP artifacts are available
+        env:
+          EXPECTED: ${{ needs.prepare.outputs.count }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "Waiting 2 minutes for all RDP jobs to upload their IPs..."
-          sleep 120
+          echo "Expecting $EXPECTED IP artifacts..."
+          echo "Polling every 10 seconds until all are ready..."
 
-      - name: Download all IP artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: ips
-          pattern: rdp-ip-*
-          merge-multiple: true
+          for i in {1..60}; do   # max ~10 minutes
+            # Download whatever is available right now
+            rm -rf ips
+            mkdir -p ips
+
+            gh run download ${{ github.run_id }} \
+              --repo ${{ github.repository }} \
+              --pattern "rdp-ip-*" \
+              --dir ips 2>/dev/null || true
+
+            COUNT=$(find ips -name "rdp-ip-*.txt" 2>/dev/null | wc -l)
+
+            echo "Found $COUNT / $EXPECTED artifacts (attempt $i)"
+
+            if [ "$COUNT" -ge "$EXPECTED" ]; then
+              echo "✅ All $EXPECTED IPs are ready!"
+              break
+            fi
+
+            sleep 10
+          done
+
+          if [ "$COUNT" -lt "$EXPECTED" ]; then
+            echo "⚠️ Only got $COUNT out of $EXPECTED after waiting. Continuing with what we have."
+          fi
 
       - name: Create single all-rdp-ips.txt + print list
         run: |
@@ -161,12 +186,12 @@ jobs:
               fi
             done
           else
-            echo "No IP artifacts found yet"
+            echo "No IP artifacts found"
           fi
 
           echo ""
           echo "════════════════════════════════════════════════════"
-          echo "File all-rdp-ips.txt is ready for download"
+          echo "File all-rdp-ips.txt is ready"
           echo "Username : RDP"
           echo "Password : (use your RDP_PASSWORD secret)"
           echo "════════════════════════════════════════════════════"
