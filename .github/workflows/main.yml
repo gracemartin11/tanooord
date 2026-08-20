@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       num_jobs:
-        description: "How many RDP jobs do you want to run? (1-15)"
+        description: "How many RDP jobs do you want to run? (1-8 recommended)"
         required: true
-        default: "1"
+        default: "2"
         type: choice
         options:
           - "1"
@@ -17,13 +17,6 @@ on:
           - "6"
           - "7"
           - "8"
-          - "9"
-          - "10"
-          - "11"
-          - "12"
-          - "13"
-          - "14"
-          - "15"
 
 jobs:
   prepare:
@@ -49,61 +42,86 @@ jobs:
       fail-fast: false
       matrix:
         job: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: 1
+      ACTIONS_RUNNER_PRINT_LOG_TO_STDOUT: 1
+
     steps:
       - name: Configure RDP
         run: |
+          Write-Host "=== Configuring RDP ==="
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
+
+          # Allow RDP through firewall
           netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+
           Restart-Service TermService -Force
+          Write-Host "RDP configured successfully"
 
       - name: Create RDP User
         run: |
+          Write-Host "=== Creating RDP User ==="
           $Password = ConvertTo-SecureString "${{ secrets.RDP_PASSWORD }}" -AsPlainText -Force
+
           if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
             Remove-LocalUser -Name "RDP"
           }
+
           New-LocalUser -Name "RDP" -Password $Password -AccountNeverExpires -PasswordNeverExpires
           Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          Write-Host "User 'RDP' created and added to Administrators"
 
       - name: Install Tailscale
         run: |
           Write-Host "=== Installing Tailscale ==="
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.84.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
+
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i `"$installerPath`" /quiet /norestart" -Wait
           Remove-Item $installerPath -Force
+          Write-Host "Tailscale installed"
 
       - name: Start Tailscale
         run: |
           Write-Host "=== Starting Tailscale ==="
           $hostname = "gh-runner-rdp-${{ github.run_id }}-${{ matrix.job }}"
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname
-          Start-Sleep -Seconds 10
+
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=$hostname `
+            --accept-dns=false
+
+          Start-Sleep -Seconds 12
+
           $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
           echo "HOSTNAME=$hostname" >> $env:GITHUB_ENV
-          Write-Host "Tailscale IP: $tsIP"
-          Write-Host "Hostname: $hostname"
 
-          # Save clean IP only
+          Write-Host "Tailscale IP   : $tsIP"
+          Write-Host "Hostname       : $hostname"
+
+          # Save clean IP
           "$tsIP" | Out-File -FilePath "rdp-ip-${{ matrix.job }}.txt" -Encoding utf8 -NoNewline
 
       - name: Verify RDP Port
         run: |
-          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          Write-Host "=== Verifying RDP Port ==="
+          $test = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
           if ($test.TcpTestSucceeded) {
-            Write-Host "RDP Port is open ✅"
+            Write-Host "RDP Port 3389 is OPEN ✅"
           } else {
             Write-Error "RDP Port test failed"
+            exit 1
           }
 
       - name: Show Connection Details
         run: |
+          Write-Host ""
           Write-Host "════════════════════════════════════════════════════"
           Write-Host "✅ RDP INSTANCE ${{ matrix.job }} IS READY"
           Write-Host "════════════════════════════════════════════════════"
@@ -112,6 +130,7 @@ jobs:
           Write-Host "Username   : RDP"
           Write-Host "Password   : (from secret RDP_PASSWORD)"
           Write-Host "════════════════════════════════════════════════════"
+          Write-Host ""
 
       - name: Upload IP artifact
         uses: actions/upload-artifact@v4
@@ -120,20 +139,66 @@ jobs:
           path: rdp-ip-${{ matrix.job }}.txt
           retention-days: 1
 
+      # ────────────────────────────────────────────────
+      # IMPROVED KEEP-ALIVE (fixes lost communication)
+      # ────────────────────────────────────────────────
       - name: Keep Runner Alive (6 hours)
         run: |
           $endTime = (Get-Date).AddHours(6)
           $counter = 0
+
+          Write-Host "Starting strong keep-alive loop until $endTime"
+
           while ((Get-Date) -lt $endTime) {
             $counter++
-            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Heartbeat #$counter – still alive (job ${{ matrix.job }})"
-            Start-Sleep -Seconds 300
+            $now = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+            Write-Host "[$now] Heartbeat #$counter – Job ${{ matrix.job }} still alive"
+
+            # 1. Write heartbeat file (disk activity)
+            "alive-$counter - $now" | Out-File -FilePath "runner-heartbeat.txt" -Force
+
+            # 2. Light network call to GitHub (keeps connection alive)
+            try {
+              Invoke-WebRequest -Uri "https://api.github.com" -UseBasicParsing -TimeoutSec 15 | Out-Null
+            } catch {
+              Write-Host "   (GitHub API ping failed - continuing)"
+            }
+
+            # 3. Show memory usage
+            $mem = [math]::Round((Get-Process -Id $PID).WorkingSet64 / 1MB, 1)
+            Write-Host "   Process memory: $mem MB"
+
+            # 4. Optional: Refresh Tailscale every ~30 minutes
+            if ($counter % 10 -eq 0) {
+              Write-Host "   Refreshing Tailscale connection..."
+              try {
+                & "$env:ProgramFiles\Tailscale\tailscale.exe" down 2>$null
+                Start-Sleep -Seconds 4
+                & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
+                  --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+                  --hostname=$env:HOSTNAME `
+                  --accept-dns=false
+                Start-Sleep -Seconds 8
+                Write-Host "   Tailscale refreshed"
+              } catch {
+                Write-Host "   Tailscale refresh failed (non-critical)"
+              }
+            }
+
+            # Sleep 3 minutes (better than 5)
+            Start-Sleep -Seconds 180
           }
 
-  # Starts right after prepare and waits only until ALL IPs are ready
+          Write-Host "Keep-alive finished after 6 hours"
+
+  # ────────────────────────────────────────────────
+  # Summarize all IPs
+  # ────────────────────────────────────────────────
   summarize:
     needs: prepare
     runs-on: ubuntu-latest
+    if: always()
     steps:
       - name: Wait until all IP artifacts are available
         env:
@@ -141,10 +206,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           echo "Expecting $EXPECTED IP artifacts..."
-          echo "Polling every 10 seconds until all are ready..."
+          echo "Polling every 10 seconds..."
 
-          for i in {1..60}; do   # max ~10 minutes
-            # Download whatever is available right now
+          for i in {1..90}; do
             rm -rf ips
             mkdir -p ips
 
@@ -154,22 +218,20 @@ jobs:
               --dir ips 2>/dev/null || true
 
             COUNT=$(find ips -name "rdp-ip-*.txt" 2>/dev/null | wc -l)
-
             echo "Found $COUNT / $EXPECTED artifacts (attempt $i)"
 
             if [ "$COUNT" -ge "$EXPECTED" ]; then
               echo "✅ All $EXPECTED IPs are ready!"
               break
             fi
-
             sleep 10
           done
 
           if [ "$COUNT" -lt "$EXPECTED" ]; then
-            echo "⚠️ Only got $COUNT out of $EXPECTED after waiting. Continuing with what we have."
+            echo "⚠️ Only got $COUNT out of $EXPECTED after waiting."
           fi
 
-      - name: Create single all-rdp-ips.txt + print list
+      - name: Create combined IP list
         run: |
           echo "════════════════════════════════════════════════════"
           echo "✅ ALL RDP IPs (copy-paste ready)"
@@ -191,12 +253,11 @@ jobs:
 
           echo ""
           echo "════════════════════════════════════════════════════"
-          echo "File all-rdp-ips.txt is ready"
           echo "Username : RDP"
           echo "Password : (use your RDP_PASSWORD secret)"
           echo "════════════════════════════════════════════════════"
 
-      - name: Upload the single combined file
+      - name: Upload combined IPs
         uses: actions/upload-artifact@v4
         with:
           name: all-rdp-ips
